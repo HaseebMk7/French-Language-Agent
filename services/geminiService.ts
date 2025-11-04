@@ -1,4 +1,4 @@
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI, Modality, Chat, Content } from "@google/genai";
 
 const SYSTEM_INSTRUCTION = `You are a friendly and patient French instructor named 'Professor Haseeb'.
 Your goal is to help the user practice and learn French through conversation.
@@ -14,71 +14,44 @@ Your goal is to help the user practice and learn French through conversation.
 
 Start the conversation with a warm welcome in French and its English translation, following the format rule.`;
 
-export const connectToLiveSession = (callbacks: {
-  onopen: () => void;
-  onmessage: (message: any) => void;
-  onerror: (e: any) => void;
-  onclose: (e: any) => void;
-}) => {
+
+export const createChat = (history?: Content[]): Chat => {
   if (!process.env.API_KEY) {
     throw new Error("API_KEY environment variable not set");
   }
-
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-  const sessionPromise = ai.live.connect({
-    model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-    callbacks,
-    config: {
-      systemInstruction: SYSTEM_INSTRUCTION,
-      responseModalities: [Modality.AUDIO],
-      inputAudioTranscription: {
-        speechRecognitionConfig: {
-          hints: [
-            // Greetings and Politeness
-            "Bonjour", "Salut", "Bonsoir", "Au revoir", "Merci", "De rien", "S'il vous plaît",
-            // Basic Questions
-            "Comment ça va ?", "Comment t'appelles-tu ?", "Quel âge as-tu ?", "Où habites-tu ?", "Qu'est-ce que c'est ?",
-            // Common Phrases
-            "Je suis", "J'ai", "J'aime", "Je n'aime pas", "Je voudrais", "Je ne comprends pas", "Pouvez-vous répéter ?",
-            // Numbers (examples)
-            "un", "deux", "trois", "dix", "vingt",
-            // Days of the week
-            "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
-            // Instructor's name
-            "Professor Haseeb",
-            // Common conversation topics for beginners
-            "la météo", "la nourriture", "les passe-temps", "la famille", "le travail"
-          ]
-        }
-      },
-      outputAudioTranscription: {},
-       speechConfig: {
-        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-      },
-    },
+  const chat = ai.chats.create({
+    model: 'gemini-2.5-flash',
+    config: { systemInstruction: SYSTEM_INSTRUCTION },
+    history: history,
   });
-
-  return sessionPromise;
+  return chat;
 };
 
-export const translateText = async (textToTranslate: string, targetLanguage: string = "English"): Promise<string> => {
-  if (!process.env.API_KEY) {
-    console.error("API_KEY environment variable not set for translation");
-    return ""; // Return empty string on error
-  }
-  try {
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: `Translate the following text to ${targetLanguage}: "${textToTranslate}"`,
-      config: {
-        temperature: 0.2,
-      }
-    });
-    return response.text.trim();
-  } catch (error) {
-    console.error("Translation failed:", error);
-    return `Translation failed for: "${textToTranslate}"`;
-  }
+
+export const textToSpeech = async (text: string): Promise<string | null> => {
+    if (!process.env.API_KEY) {
+        console.error("API_KEY not set for TTS");
+        return null;
+    }
+    try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash-preview-tts",
+            contents: [{ parts: [{ text: `Say with a friendly and encouraging tone: ${text}` }] }],
+            config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: {
+                    voiceConfig: {
+                      prebuiltVoiceConfig: { voiceName: 'Kore' },
+                    },
+                },
+            },
+        });
+        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        return base64Audio ?? null;
+    } catch (error) {
+        console.error("TTS generation failed:", error);
+        return null;
+    }
 };

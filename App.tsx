@@ -1,22 +1,46 @@
-
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-// Fix: Removed 'LiveSession' as it is not an exported member of '@google/genai'.
-import { Blob, LiveServerMessage } from "@google/genai";
-import { Message, Role, ConnectionStatus } from './types';
-import { connectToLiveSession, translateText } from './services/geminiService';
+import React, { useState, useEffect, useRef } from 'react';
+import { Chat, Content } from "@google/genai";
+import { Message, Role } from './types';
+import { createChat, textToSpeech } from './services/geminiService';
 import { ChatMessage } from './components/ChatMessage';
 import { ChatControls } from './components/ChatInput';
 
-// Audio Encoding/Decoding Helpers
-function encode(bytes: Uint8Array) {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
+// Add type definitions for SpeechRecognition to fix compilation error.
+// The Web Speech API types are not included in standard TypeScript DOM libraries.
+interface SpeechRecognitionErrorEvent {
+  readonly error: string;
+}
+interface SpeechRecognitionAlternative {
+  readonly transcript: string;
+}
+interface SpeechRecognitionResult {
+  readonly isFinal: boolean;
+  readonly length: number;
+  item(index: number): SpeechRecognitionAlternative;
+  [index: number]: SpeechRecognitionAlternative;
+}
+interface SpeechRecognitionResultList {
+  readonly length: number;
+  item(index: number): SpeechRecognitionResult;
+  [index: number]: SpeechRecognitionResult;
+}
+interface SpeechRecognitionEvent {
+  readonly resultIndex: number;
+  readonly results: SpeechRecognitionResultList;
+}
+interface SpeechRecognition {
+  continuous: boolean;
+  lang: string;
+  interimResults: boolean;
+  onstart: () => void;
+  onend: () => void;
+  onerror: (event: SpeechRecognitionErrorEvent) => void;
+  onresult: (event: SpeechRecognitionEvent) => void;
+  stop: () => void;
+  start: () => void;
 }
 
+// Audio Decoding Helpers
 function decode(base64: string) {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -46,233 +70,175 @@ async function decodeAudioData(
   return buffer;
 }
 
-function createBlob(data: Float32Array): Blob {
-  const l = data.length;
-  const int16 = new Int16Array(l);
-  for (let i = 0; i < l; i++) {
-    int16[i] = data[i] * 32768;
-  }
-  return {
-    data: encode(new Uint8Array(int16.buffer)),
-    mimeType: 'audio/pcm;rate=16000',
-  };
-}
 
 const App: React.FC = () => {
-  const [messages, setMessages] = useState<Message[]>([
+  const [messages, setMessages] = useState<Message[]>(() => {
+    try {
+        const savedMessages = localStorage.getItem('french-chat-history');
+        if (savedMessages) {
+            const parsedMessages = JSON.parse(savedMessages);
+            if (Array.isArray(parsedMessages) && parsedMessages.length > 0) {
+                return parsedMessages;
+            }
+        }
+    } catch (error) {
+        console.error("Failed to load messages from localStorage:", error);
+    }
+    return [
       {
           role: Role.MODEL, 
-          french: "Bonjour ! Appuyez sur le micro pour commencer à pratiquer votre français.",
-          english: "Hello! Press the microphone to start practicing your French."
+          french: "Bonjour ! Appuyez sur le micro ou tapez un message pour commencer à pratiquer votre français.",
+          english: "Hello! Press the microphone or type a message to start practicing your French."
       }
-  ]);
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(ConnectionStatus.IDLE);
+    ];
+  });
   const [textInput, setTextInput] = useState('');
   const [showTranslation, setShowTranslation] = useState<boolean>(true);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isResponding, setIsResponding] = useState(false);
+  
   const chatContainerRef = useRef<HTMLDivElement>(null);
-  
-  // Fix: Replaced the non-existent 'LiveSession' type with an inferred return type
-  // from `connectToLiveSession` for type safety without breaking compilation.
-  const sessionPromiseRef = useRef<ReturnType<typeof connectToLiveSession> | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const inputAudioContextRef = useRef<AudioContext | null>(null);
-  const outputAudioContextRef = useRef<AudioContext | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  
-  const nextStartTimeRef = useRef<number>(0);
-  const audioSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const chatRef = useRef<Chat | null>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
-  const currentInputTranscriptionRef = useRef('');
-  const currentOutputTranscriptionRef = useRef('');
+  useEffect(() => {
+    try {
+        localStorage.setItem('french-chat-history', JSON.stringify(messages));
+    } catch (error) {
+        console.error("Failed to save messages to localStorage:", error);
+    }
+  }, [messages]);
 
-
-  const disconnect = useCallback(() => {
-    sessionPromiseRef.current?.then(session => session.close());
-    streamRef.current?.getTracks().forEach(track => track.stop());
-    scriptProcessorRef.current?.disconnect();
-    mediaStreamSourceRef.current?.disconnect();
-    inputAudioContextRef.current?.close();
-    outputAudioContextRef.current?.close();
+  useEffect(() => {
+    // Initialize chat with history from loaded messages
+    const history: Content[] = messages.map(msg => ({
+        role: msg.role,
+        parts: [{ text: msg.french }]
+    }));
     
-    sessionPromiseRef.current = null;
-    streamRef.current = null;
-    inputAudioContextRef.current = null;
-    outputAudioContextRef.current = null;
-    scriptProcessorRef.current = null;
-    mediaStreamSourceRef.current = null;
+    // Don't pass history if it's just the initial default message
+    const defaultMessageText = "Bonjour ! Appuyez sur le micro ou tapez un message pour commencer à pratiquer votre français.";
+    const isOnlyDefaultMessage = messages.length === 1 && messages[0].french === defaultMessageText;
     
-    setConnectionStatus(ConnectionStatus.IDLE);
+    chatRef.current = createChat(isOnlyDefaultMessage ? undefined : history);
+
+    audioContextRef.current = new ((window as any).AudioContext || (window as any).webkitAudioContext)();
+    
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition: SpeechRecognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.lang = 'fr-FR';
+      recognition.interimResults = true;
+
+      recognition.onstart = () => setIsRecording(true);
+      recognition.onend = () => setIsRecording(false);
+      recognition.onerror = (event) => {
+        console.error('Speech recognition error:', event.error);
+        setIsRecording(false);
+      };
+
+      recognition.onresult = (event) => {
+        let interimTranscript = '';
+        let finalTranscript = '';
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            finalTranscript += event.results[i][0].transcript;
+          } else {
+            interimTranscript += event.results[i][0].transcript;
+          }
+        }
+        setTextInput(interimTranscript);
+
+        if (finalTranscript) {
+          setTextInput('');
+          handleSendMessage(finalTranscript);
+        }
+      };
+      recognitionRef.current = recognition;
+    } else {
+      console.warn("Speech Recognition not supported by this browser.");
+    }
   }, []);
-
-  const handleToggleConnection = () => {
-    if (connectionStatus === ConnectionStatus.CONNECTED) {
-      disconnect();
-    } else if (connectionStatus === ConnectionStatus.IDLE || connectionStatus === ConnectionStatus.ERROR) {
-      connect();
+  
+  const handleToggleMic = () => {
+    if (!recognitionRef.current) return;
+    if (isRecording) {
+      recognitionRef.current.stop();
+    } else {
+      recognitionRef.current.start();
     }
   };
 
-  const handleSendText = async (text: string) => {
-    const trimmedText = text.trim();
-    if (!trimmedText || connectionStatus !== ConnectionStatus.CONNECTED) return;
-  
-    const session = await sessionPromiseRef.current;
-    if (!session) return;
-  
-    const userMessage: Message = { role: Role.USER, french: trimmedText };
-    setMessages(prev => [...prev, userMessage]);
+  const handleSendText = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || isResponding || isRecording) return;
+    handleSendMessage(trimmed);
     setTextInput('');
-  
-    // Fix: Cast session to 'any' to call 'sendTextMessage'. This preserves the functionality
-    // of sending text messages, which appears to be an undocumented feature of the Live API,
-    // and avoids a TypeScript error that would occur with the new inferred session type.
-    (session as any).sendTextMessage(trimmedText);
-  
-    translateText(trimmedText).then(englishText => {
-      setMessages(prev => {
-        const newMessages = [...prev];
-        let targetIndex = -1;
-        // Find the message we just added (the one without an English translation yet) and update it.
-        for (let i = newMessages.length - 1; i >= 0; i--) {
-          if (newMessages[i].role === Role.USER && newMessages[i].french === trimmedText && !newMessages[i].english) {
-            targetIndex = i;
-            break;
-          }
-        }
-        if (targetIndex !== -1) {
-          newMessages[targetIndex] = { ...newMessages[targetIndex], english: englishText };
-        }
-        return newMessages;
-      });
-    });
   };
 
-  const connect = useCallback(() => {
-    setConnectionStatus(ConnectionStatus.CONNECTING);
-    
-    outputAudioContextRef.current = new ((window as any).AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-    const outputNode = outputAudioContextRef.current.createGain();
-    
-    sessionPromiseRef.current = connectToLiveSession({
-        onopen: async () => {
-            setConnectionStatus(ConnectionStatus.CONNECTED);
-            streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
-            
-            inputAudioContextRef.current = new ((window as any).AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-            mediaStreamSourceRef.current = inputAudioContextRef.current.createMediaStreamSource(streamRef.current);
-            scriptProcessorRef.current = inputAudioContextRef.current.createScriptProcessor(4096, 1, 1);
+  const handleSendMessage = async (text: string) => {
+    setIsResponding(true);
 
-            scriptProcessorRef.current.onaudioprocess = (audioProcessingEvent) => {
-                const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
-                const pcmBlob = createBlob(inputData);
-                sessionPromiseRef.current?.then((session) => {
-                    session.sendRealtimeInput({ media: pcmBlob });
-                });
-            };
-            mediaStreamSourceRef.current.connect(scriptProcessorRef.current);
-            scriptProcessorRef.current.connect(inputAudioContextRef.current.destination);
-        },
-        onmessage: async (message: LiveServerMessage) => {
-            // Handle transcriptions
-            if (message.serverContent?.inputTranscription) {
-                 const text = message.serverContent.inputTranscription.text;
-                 
-                 setMessages(prev => {
-                    const lastMessage = prev[prev.length - 1];
-                    if (lastMessage?.role === Role.USER) {
-                       return prev.map((msg, i) => i === prev.length - 1 ? { ...msg, french: currentInputTranscriptionRef.current + text } : msg);
-                    } else {
-                       return [...prev, {role: Role.USER, french: text}];
-                    }
-                 });
-                 currentInputTranscriptionRef.current += text;
-            }
+    const userMessage: Message = { role: Role.USER, french: text };
+    setMessages(prev => [...prev, userMessage]);
 
-            if (message.serverContent?.outputTranscription) {
-                const rawText = message.serverContent.outputTranscription.text;
-                currentOutputTranscriptionRef.current += rawText;
+    try {
+      if (!chatRef.current) throw new Error("Chat not initialized");
 
-                const fullText = currentOutputTranscriptionRef.current;
-                const frenchMatch = fullText.match(/\[FR\](.*?)(?=\[EN\]|$)/s);
-                const englishMatch = fullText.match(/\[EN\](.*?)$/s);
-                
-                const french = frenchMatch ? frenchMatch[1].trim() : fullText;
-                const english = englishMatch ? englishMatch[1].trim() : undefined;
+      const responseStream = await chatRef.current.sendMessageStream({ message: text });
+      
+      let fullResponseText = "";
+      let frenchPart = "";
+      let englishPart = "";
 
-                setMessages(prev => {
-                    const lastMessage = prev[prev.length - 1];
-                    if (lastMessage?.role === Role.MODEL) {
-                        return prev.map((msg, i) => i === prev.length - 1 ? { ...msg, french, english } : msg);
-                    } else {
-                        return [...prev, {role: Role.MODEL, french, english}];
-                    }
-                });
-            }
+      setMessages(prev => [...prev, {role: Role.MODEL, french: '...'}]);
 
-            if (message.serverContent?.turnComplete) {
-                if(currentInputTranscriptionRef.current) {
-                    const userFrenchText = currentInputTranscriptionRef.current;
-                    translateText(userFrenchText).then(englishText => {
-                        setMessages(prev => {
-                            const newMessages = [...prev];
-                            let targetIndex = -1;
-                            for (let i = newMessages.length - 1; i >= 0; i--) {
-                              if (newMessages[i].role === Role.USER && newMessages[i].french === userFrenchText) {
-                                targetIndex = i;
-                                break;
-                              }
-                            }
-                            if(targetIndex !== -1) {
-                                newMessages[targetIndex] = { ...newMessages[targetIndex], english: englishText };
-                            }
-                            return newMessages;
-                        });
-                    });
-                }
-                currentInputTranscriptionRef.current = '';
-                currentOutputTranscriptionRef.current = '';
-            }
+      for await (const chunk of responseStream) {
+        fullResponseText += chunk.text;
+        
+        const frenchMatch = fullResponseText.match(/\[FR\](.*?)(?=\[EN\]|$)/s);
+        const englishMatch = fullResponseText.match(/\[EN\](.*?)$/s);
+        
+        frenchPart = frenchMatch ? frenchMatch[1].trim() : fullResponseText.replace('[FR]','').trim();
+        englishPart = englishMatch ? englishMatch[1].trim() : "";
+        
+        setMessages(prev => {
+          const newMessages = [...prev];
+          newMessages[newMessages.length - 1] = { role: Role.MODEL, french: frenchPart, english: englishPart };
+          return newMessages;
+        });
+      }
 
-            // Handle audio playback
-            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio && outputAudioContextRef.current) {
-                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputAudioContextRef.current.currentTime);
-                const audioBuffer = await decodeAudioData(decode(base64Audio), outputAudioContextRef.current, 24000, 1);
-                const source = outputAudioContextRef.current.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(outputNode);
-                source.addEventListener('ended', () => { audioSourcesRef.current.delete(source); });
-                source.start(nextStartTimeRef.current);
-                nextStartTimeRef.current += audioBuffer.duration;
-                audioSourcesRef.current.add(source);
-            }
+      if (frenchPart) {
+        const base64Audio = await textToSpeech(frenchPart);
+        if (base64Audio && audioContextRef.current) {
+          try {
+            const audioData = decode(base64Audio);
+            const buffer = await decodeAudioData(audioData, audioContextRef.current, 24000, 1);
+            const source = audioContextRef.current.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContextRef.current.destination);
+            source.start(0);
+          } catch(e) {
+             console.error("Failed to decode or play audio", e);
+          }
+        }
+      }
 
-            if (message.serverContent?.interrupted) {
-                for (const source of audioSourcesRef.current.values()) {
-                    source.stop();
-                    audioSourcesRef.current.delete(source);
-                }
-                nextStartTimeRef.current = 0;
-            }
-        },
-        onerror: (e: ErrorEvent) => {
-            console.error("Session error:", e);
-            setMessages(prev => [...prev, {
-                role: Role.MODEL, 
-                french: "Désolé, une erreur de connexion est survenue.",
-                english: "Sorry, a connection error occurred."
-            }]);
-            setConnectionStatus(ConnectionStatus.ERROR);
-            disconnect();
-        },
-        onclose: (e: CloseEvent) => {
-            console.log("Session closed.");
-            disconnect();
-        },
-    });
+    } catch (error) {
+      console.error("Error sending message:", error);
+      setMessages(prev => [...prev, {
+        role: Role.MODEL, 
+        french: "Désolé, une erreur est survenue. Veuillez réessayer.",
+        english: "Sorry, an error occurred. Please try again."
+      }]);
+    } finally {
+      setIsResponding(false);
+    }
+  };
 
-  }, [disconnect]);
 
   useEffect(() => {
     if (chatContainerRef.current) {
@@ -308,12 +274,16 @@ const App: React.FC = () => {
           {messages.map((msg, index) => (
             <ChatMessage key={index} message={msg} showTranslation={showTranslation} />
           ))}
+           {isResponding && messages[messages.length - 1]?.role !== Role.MODEL && (
+             <ChatMessage message={{role: Role.MODEL, french: "..."}} showTranslation={false}/>
+           )}
         </div>
       </main>
       <footer className="sticky bottom-0">
         <ChatControls 
-            onToggleConnection={handleToggleConnection} 
-            connectionStatus={connectionStatus}
+            onToggleMic={handleToggleMic} 
+            isRecording={isRecording}
+            isResponding={isResponding}
             onSendText={handleSendText}
             textInput={textInput}
             onTextInputChange={setTextInput}
