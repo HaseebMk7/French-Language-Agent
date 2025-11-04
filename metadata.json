@@ -1,0 +1,7 @@
+{
+  "name": "Personalized French Instructor",
+  "description": "An interactive AI-powered chat application to practice and learn French. Get instant feedback, corrections, and explanations from your personalized instructor, 'Professor Haseeb'.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
